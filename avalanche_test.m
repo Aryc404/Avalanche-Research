@@ -1,296 +1,287 @@
 function result = avalanche_test()
-% 冻结 AD 网络，连续呈现 100 个 patch。
+% result：实验结果
+%% 参数
+N_p = 10000; % patch数
+N_t = 400; % 每patch步数
+dt_ms = 1; % 步长(ms)
+seed = 20261123; % 随机种子
+T = N_p*N_t; % 总步数
 
-%% 读取网络
-experiment_dir = fileparts(mfilename('fullpath'));
-model_dir = fullfile(experiment_dir,'..','Ruslim network','bio-spiking-v1-learning-main');
-checkpoint_file = fullfile(experiment_dir,'pcb_shuffle_ad_paper_cn1_run01_batch1200.mat');
-loaded = load(checkpoint_file,'checkpoint');
-checkpoint = loaded.checkpoint;
-state = checkpoint.state;
-
-n_patches = 100;
-patch_steps = 400;
-dt_ms = 1;
-dt = dt_ms/1000;
-seed = 20261123;
-N_E = size(state.W_EE,1);
-N_I = size(state.W_II,1);
-N_X = size(state.W_EX,2)/2;
-total_steps = n_patches*patch_steps;
-
-old_rng = rng;
-old_path = path;
-session_cleanup = onCleanup(@() restore_session(old_rng,old_path));
-addpath(model_dir);
+%% 读入
+base = fileparts(mfilename('fullpath')); % 实验目录
+model = fullfile(base,'..','Ruslim network','bio-spiking-v1-learning-main'); % 原模型目录
+file = fullfile(base,'pcb_shuffle_ad_paper_cn1_run01_batch1200.mat'); % 检查点路径
+cp = load(file,'checkpoint'); % 检查点数据
+cp = cp.checkpoint;
+net = cp.state; % 权重与阈值
+rng0 = rng; % 原随机状态
+path0 = path; % 原搜索路径
+cleanup = onCleanup(@() restore(rng0,path0)); % 退出恢复状态
+addpath(model);
 rng(seed,'twister');
 
-protocol = struct('checkpoint_file',checkpoint_file,'checkpoint_batch',checkpoint.batch, ...
-    'seed',seed,'n_patches',n_patches,'patch_ms',patch_steps*dt_ms, ...
-    'dt_ms',dt_ms,'total_ms',total_steps*dt_ms);
+img = load(fullfile(base,'VanHateren_DoG_small.mat'),'IMAGES_DoG'); % DoG图像
+N_X = size(net.W_EX,2)/2; % patch像素数
+R = min(generate_image_patches(img.IMAGES_DoG,N_X,N_p),100); % 输入率(Hz)
+clear img
 
-%% 抽取 patch
-image_data = load(fullfile(experiment_dir,'VanHateren_DoG_small.mat'),'IMAGES_DoG');
-patch_rates_Hz = generate_image_patches(image_data.IMAGES_DoG,N_X,n_patches);
-patch_rates_Hz = min(patch_rates_Hz,100);
-
-%% 网络仿真
-V_E = zeros(N_E,1); V_I = zeros(N_I,1);
-exp_m = exp(-dt/10e-3);
-spikes_E = false(N_E,total_steps);
-spikes_I = false(N_I,total_steps);
-for patch = 1:n_patches
-    input_probability = patch_rates_Hz(:,patch)*dt;
-    for local_step = 1:patch_steps
-        step = (patch-1)*patch_steps+local_step;
-        S_X = sparse(double(rand(2*N_X,1)<input_probability));
-        S_E = V_E>state.theta_E;
-        S_I = V_I>state.theta_I;
-        spikes_E(:,step) = S_E;
-        spikes_I(:,step) = S_I;
-        V_E(S_E) = 0; V_I(S_I) = 0;
-        E = sparse(double(S_E)); I = sparse(double(S_I));
-        V_E = V_E*exp_m+state.W_EX*S_X+state.W_EE*E-state.W_EI*I+randn(N_E,1);
-        V_I = V_I*exp_m+state.W_IX*S_X+state.W_IE*E-state.W_II*I+randn(N_I,1);
-        V_E = max(V_E,-10); V_I = max(V_I,-10);
-    end
-end
-
-%% 保存与统计
-output_dir = fullfile(experiment_dir,'results','avalanche_test', ...
+%% 连续仿真
+[X,M,G] = run_net(net,R,N_t,dt_ms); % X：E记录；M：spike数；G：间隔和(ms)
+Tm = G/max(M-1,0); % 群体平均间隔(ms)
+cfg = struct('checkpoint_file',file,'checkpoint_batch',cp.batch, ... % 实验设置
+    'seed',seed,'n_patches',N_p,'patch_ms',N_t*dt_ms, ...
+    'dt_ms',dt_ms,'total_ms',T*dt_ms);
+folder = fullfile(base,'results','avalanche_test', ... % 保存目录
     char(datetime('now','Format','yyyyMMdd_HHmmss_SSS')));
-mkdir(output_dir);
-result = struct('protocol',protocol,'frozen_state',state, ...
-    'patch_rates_Hz',patch_rates_Hz,'patch_start_step',1:patch_steps:total_steps, ...
-    'spikes_E',spikes_E,'spikes_I',spikes_I);
-result.output_file = fullfile(output_dir,'result.mat');
-result.stepp_figure = fullfile(output_dir,'stepp_summary.png');
-result.ma_figure = fullfile(output_dir,'ma_summary.png');
+mkdir(folder);
+result = struct('protocol',cfg,'frozen_state',net, ...
+    'patch_rates_Hz',R,'patch_start_step',1:N_t:T,'spikes_E',X, ...
+    'spike_count',M,'interval_sum_ms',G,'mean_interval_ms',Tm);
+result.output_file = fullfile(folder,'result.mat');
+result.stepp_figure = fullfile(folder,'stepp_summary.png');
+result.ma_figure = fullfile(folder,'ma_summary.png');
+result.liang_figure = fullfile(folder,'liang_summary.png');
+result.ikeda_figure = fullfile(folder,'ikeda_summary.png');
 save(result.output_file,'result','-v7.3');
 
-result.stepp = analyze_stepp(spikes_E,state.W_EE,dt_ms);
-result.ma = analyze_ma(spikes_E,dt_ms);
+%% 统计
+result.stepp = analyze_stepp(X,net.W_EE,dt_ms);
+result.ma = analyze_ma(X,dt_ms);
+result.liang = analyze_liang(X,dt_ms,Tm);
+result.ikeda = analyze_ikeda(X,dt_ms,Tm);
 save(result.output_file,'result','-v7.3');
 
 %% 绘图
-draw_stepp(result);
-draw_ma(result);
-fprintf('%s\n',output_dir);
+plot_stepp(result);
+plot_bins(result.ma,result.ma_figure,'Ma');
+plot_bins(result.liang,result.liang_figure,'Liang');
+plot_ikeda(result.ikeda,result.ikeda_figure);
+fprintf('%s\n',folder);
 end
 
-function restore_session(old_rng,old_path)
-rng(old_rng);
-path(old_path);
-end
+function [X,M,G] = run_net(net,R,N_t,dt_ms)
+% net：网络参数；R：输入率(Hz)；N_t：每patch步数；dt_ms：步长(ms)
+% X：E放电矩阵；M：spike总数；G：间隔和(ms)
+N_E = size(net.W_EE,1); % E神经元数
+N_I = size(net.W_II,1); % I神经元数
+N_p = size(R,2); % patch数
+N_L = size(R,1); % LGN通道数
+dt = dt_ms/1000; % 步长(s)
+a_m = exp(-dt/10e-3); % 膜电位衰减系数
+V_E = zeros(N_E,1); % E膜电位
+V_I = zeros(N_I,1); % I膜电位
+X = false(N_E,N_p*N_t);
+M = 0;
+G = 0;
+tp = 0; % 上次群体放电步
 
-function draw_stepp(result)
-s = result.stepp;
-f = figure('Visible','off','Color','w','Theme','light','Position',[100 100 1550 950]);
-t = tiledlayout(f,2,3,'TileSpacing','compact','Padding','compact');
-
-ax = nexttile(t,1);
-raster_end_ms = min(2000,result.protocol.total_ms);
-[ids,steps] = find(result.spikes_E(:,1:round(raster_end_ms/result.protocol.dt_ms)));
-plot(ax,(steps-1)*result.protocol.dt_ms/1000,ids,'.','Color',[0 0.35 0.8],'MarkerSize',3);
-hold(ax,'on');
-for boundary = result.protocol.patch_ms:result.protocol.patch_ms:raster_end_ms-1
-    xline(ax,boundary/1000,':','Color',[0.7 0.7 0.7]);
-end
-title(ax,'A  E spike raster; dotted lines = patch changes');
-xlabel(ax,'Time (s)'); ylabel(ax,'E neuron ID');
-xlim(ax,[0 raster_end_ms/1000]); ylim(ax,[0.5 size(result.spikes_E,1)+0.5]);
-
-ax = nexttile(t,2);
-p = s.preview;
-edges = double(p.parent_edges);
-if ~isempty(edges)
-    x = [p.time_ms(edges(:,1))';p.time_ms(edges(:,2))';NaN(1,size(edges,1))];
-    y = [double(p.neuron_id(edges(:,1)))';double(p.neuron_id(edges(:,2)))';NaN(1,size(edges,1))];
-    plot(ax,x(:),y(:),'-','Color',[0.8 0.8 0.8]);
-    hold(ax,'on');
-end
-is_root = false(numel(p.neuron_id),1);
-label_count = cellfun(@numel,p.memberships);
-for k = 1:numel(is_root)
-    labels = p.memberships{k};
-    if isscalar(labels)
-        is_root(k) = s.tracking.start_step(labels)==p.step_index(k) && ...
-            s.tracking.start_neuron(labels)==p.neuron_id(k);
+for p = 1:N_p % patch编号
+    P_X = R(:,p)*dt; % LGN单步发放概率
+    for j = 1:N_t % patch内步编号
+        t = (p-1)*N_t+j; % 全局步编号
+        S_X = sparse(double(rand(N_L,1)<P_X)); % LGN当前放电
+        S_E = V_E>net.theta_E; % E当前放电
+        S_I = V_I>net.theta_I; % I当前放电
+        X(:,t) = S_E;
+        c = nnz(S_E); % 当前E spike数
+        if c > 0
+            if M > 0, G = G+(t-tp)*dt_ms; end
+            M = M+c;
+            tp = t;
+        end
+        V_E(S_E) = 0;
+        V_I(S_I) = 0;
+        E = sparse(double(S_E)); % E放电向量
+        I = sparse(double(S_I)); % I放电向量
+        V_E = V_E*a_m+net.W_EX*S_X+net.W_EE*E-net.W_EI*I+randn(N_E,1);
+        V_I = V_I*a_m+net.W_IX*S_X+net.W_IE*E-net.W_II*I+randn(N_I,1);
+        V_E = max(V_E,-10);
+        V_I = max(V_I,-10);
     end
+    if mod(p,1000) == 0, fprintf('Patch %d / %d\n',p,N_p); end
 end
-hold(ax,'on');
-h1 = plot(ax,p.time_ms(is_root),double(p.neuron_id(is_root)),'s', ...
-    'Color',[0.8 0.25 0.1],'MarkerFaceColor',[0.8 0.25 0.1],'MarkerSize',4);
-single = ~is_root & label_count==1;
-h2 = plot(ax,p.time_ms(single),double(p.neuron_id(single)),'.','Color',[0 0.35 0.8],'MarkerSize',8);
-shared = label_count>1;
-h3 = plot(ax,p.time_ms(shared),double(p.neuron_id(shared)),'o','Color',[0.15 0.15 0.15],'MarkerSize',5);
-title(ax,'B  Connection tracking: first 100 ms, up to 200 spikes');
-xlabel(ax,'Time (ms)'); ylabel(ax,'E neuron ID');
-xlim(ax,[0 100]); ylim(ax,[0.5 size(result.spikes_E,1)+0.5]);
-legend(ax,[h1 h2 h3],{'Root','Inherited','Shared by roots'},'Location','best');
+end
 
-ax = nexttile(t,3);
-d = s.size_distribution;
+function restore(rng0,path0)
+% rng0：原随机状态；path0：原搜索路径
+rng(rng0);
+path(path0);
+end
+
+function plot_stepp(r)
+% r：实验结果
+s = r.stepp; % Stepp结果
+f = figure('Visible','off','Color','w','Theme','light','Position',[100 100 1450 440]); % 图窗
+tl = tiledlayout(f,1,3,'TileSpacing','compact','Padding','compact'); % 子图布局
+
+ax = nexttile(tl,1); % 当前坐标轴
+d = s.size_distribution; % 大小分布
 loglog(ax,d.S,d.P,'o','Color',[0 0.35 0.8],'MarkerSize',4);
 hold(ax,'on');
 if d.fit_valid
     loglog(ax,d.S,10.^polyval([d.slope d.intercept],log10(d.S)), ...
         '-','Color',[0.8 0.25 0.1],'LineWidth',1.4);
-    legend(ax,{'Observed','Descriptive OLS'},'Location','best');
+    legend(ax,{'Data','OLS fit'},'Location','best');
 end
-title(ax,{'C  Avalanche size distribution', ...
-    sprintf('Complete events: %d; k = %.3f',s.tracking.complete_count,d.slope)});
-xlabel(ax,'S (spikes per avalanche)'); ylabel(ax,'P(S)');
-if isempty(d.S)
-    text(ax,0.5,0.5,'No complete avalanches','Units','normalized','HorizontalAlignment','center');
-end
+title(ax,'A  Size distribution');
+subtitle(ax,sprintf('k = %.3f; n = %d',d.slope,s.tracking.complete_count));
+xlabel(ax,'S (spikes)'); ylabel(ax,'P(S)');
 
-ax = nexttile(t,4);
-b = s.branching;
-plot(ax,b.time_ms/1000,b.value,'.','Color',[0.75 0.75 0.75],'MarkerSize',2);
+ax = nexttile(tl,2);
+b = s.branching; % 分支比结果
+B = round(10000/r.protocol.dt_ms); % 显示窗口步数
+Nb = ceil(numel(b.value)/B); % 显示窗口数
+v = NaN(1,Nb); % 分块平均分支比
+t = zeros(1,Nb); % 窗口中心(s)
+for j = 1:Nb % 显示窗口编号
+    k = (j-1)*B+1:min(j*B,numel(b.value)); % 当前窗口步
+    v(j) = mean(b.value(k),'omitnan');
+    t(j) = (mean([k(1) k(end)])-1)*r.protocol.dt_ms/1000;
+end
+plot(ax,t,v,'Color',[0 0.35 0.8],'LineWidth',1.3);
 hold(ax,'on');
-plot(ax,b.time_ms/1000,movmean(b.value,1000,'omitnan'), ...
-    'Color',[0 0.35 0.8],'LineWidth',1.3);
 yline(ax,1,'--','Color',[0.8 0.25 0.1]);
-title(ax,{'D  Network branching ratio',sprintf('Valid time points: %d; mean = %.3f',b.valid_count,b.mean)});
-xlabel(ax,'Time (s)'); ylabel(ax,'s(n)');
-legend(ax,{'Raw','1-s moving mean','s = 1'},'Location','best');
-xlim(ax,[0 result.protocol.total_ms/1000]);
+title(ax,'B  Branching ratio');
+subtitle(ax,sprintf('Mean = %.3f',b.mean));
+xlabel(ax,'Time (s)'); ylabel(ax,'s (10-s mean)');
+xlim(ax,[0 r.protocol.total_ms/1000]);
 
-ax = nexttile(t,5);
-hold(ax,'on');
-for k = 1:numel(s.dfa.F)
-    selected = s.dfa.F{k}>0;
-    loglog(ax,s.dfa.scales{k}(selected),s.dfa.F{k}(selected), ...
-        'Color',[0.8 0.8 0.8],'LineWidth',0.5);
-end
-example = find(isfinite(s.dfa.alpha),1);
-if ~isempty(example)
-    l = s.dfa.scales{example}; F = s.dfa.F{example};
-    loglog(ax,l,F,'o-','Color',[0 0.35 0.8],'MarkerSize',3);
-    loglog(ax,l,10.^polyval([s.dfa.alpha(example) s.dfa.intercept(example)],log10(l)), ...
-        '--','Color',[0.8 0.25 0.1]);
-end
-set(ax,'XScale','log','YScale','log');
-title(ax,'E  ISI-DFA; gray = individual E neurons');
-xlabel(ax,'l (ISI samples per segment)'); ylabel(ax,'F(l) (ms)');
-
-ax = nexttile(t,6);
-valid = isfinite(s.dfa.alpha);
-values = s.dfa.alpha(valid);
-if ~isempty(values)
-    lo = min(values); hi = max(values);
-    if lo==hi, lo=lo-0.1; hi=hi+0.1; end
-    bins = linspace(lo,hi,21);
-    histogram(ax,s.dfa.alpha(valid & s.dfa.limited_span),bins, ...
-        'DisplayStyle','stairs','EdgeColor',[0.8 0.45 0.1],'LineWidth',1.2);
-    hold(ax,'on');
-    histogram(ax,s.dfa.alpha(valid & ~s.dfa.limited_span),bins, ...
-        'DisplayStyle','stairs','EdgeColor',[0 0.35 0.8],'LineWidth',1.2);
-    legend(ax,{'Scale span < 1 decade','Scale span >= 1 decade'},'Location','best');
+ax = nexttile(tl,3);
+ok = isfinite(s.dfa.alpha) & ~s.dfa.limited_span; % 尺度足够的拟合
+if any(ok)
+    histogram(ax,s.dfa.alpha(ok),20,'FaceColor',[0 0.35 0.8],'EdgeColor','none');
 else
-    text(ax,0.5,0.5,'Too few ISIs / usable scales','Units','normalized','HorizontalAlignment','center');
+    text(ax,0.5,0.5,'Insufficient scale range','Units','normalized', ...
+        'HorizontalAlignment','center');
 end
-title(ax,{'F  DFA exponents (descriptive)', ...
-    sprintf('%d / %d fits; %d span >= 1 decade',s.dfa.valid_count, ...
-    size(result.spikes_E,1),s.dfa.adequate_span_count)});
-xlabel(ax,'\alpha_{DFA}'); ylabel(ax,'Number of E neurons');
-title(t,'Stepp framework: frozen E network; pre/post lags 2-4 ms');
-exportgraphics(f,result.stepp_figure,'Resolution',180);
+title(ax,'C  DFA exponent distribution');
+subtitle(ax,sprintf('%d / %d neurons; span >= 1 decade',nnz(ok),size(r.spikes_E,1)));
+xlabel(ax,'\alpha_{DFA}'); ylabel(ax,'E neurons');
+title(tl,'Stepp');
+exportgraphics(f,r.stepp_figure,'Resolution',180);
 close(f);
 end
 
-function draw_ma(result)
-m = result.ma;
-f = figure('Visible','off','Color','w','Theme','light','Position',[100 100 1350 950]);
-t = tiledlayout(f,2,2,'TileSpacing','compact','Padding','compact');
-
-ax = nexttile(t,1);
+function plot_bins(m,file,name)
+% m：分箱结果；file：图片路径；name：方法名
+f = figure('Visible','off','Color','w','Theme','light','Position',[100 100 1100 820]); % 图窗
+tl = tiledlayout(f,2,2,'TileSpacing','compact','Padding','compact'); % 子图布局
+ax = nexttile(tl,1); % 当前坐标轴
 hold(ax,'on');
-shown_end = min(4,m.recorded_ms/1000);
-top = max([m.activity m.threshold 1])*1.15;
-for k = 1:numel(m.events.S)
-    left = m.events.start_ms(k)/1000;
-    right = m.events.end_ms(k)/1000;
-    if left < shown_end
-        patch(ax,[left right right left],[0 0 top top],[0 0.35 0.8], ...
+tmax = min(4,m.recorded_ms/1000); % 显示时长(s)
+use = m.time_s <= tmax; % 显示bin
+if any(use)
+    ymax = max([m.activity(use) 1])*1.15; % 纵轴上限
+    for k = find(m.events.start_ms < tmax*1000) % 显示事件编号
+        t0 = m.events.start_ms(k)/1000; % 事件起点(s)
+        t1 = min(m.events.end_ms(k)/1000,tmax); % 事件终点(s)
+        patch(ax,[t0 t1 t1 t0],[0 0 ymax ymax],[0 0.35 0.8], ...
             'FaceAlpha',0.12,'EdgeColor','none','HandleVisibility','off');
     end
+    plot(ax,m.time_s(use),m.activity(use),'Color',[0.15 0.15 0.15],'LineWidth',1);
+    xlim(ax,[0 tmax]); ylim(ax,[0 ymax]);
 end
-h1 = plot(ax,m.time_s,m.activity,'Color',[0.15 0.15 0.15],'LineWidth',1);
-h2 = yline(ax,m.threshold,'--','Color',[0 0.35 0.8],'LineWidth',1.2);
-title(ax,{'A  Active E neurons in 40-ms bins (first 4 s)', ...
-    sprintf('35th-percentile threshold = %.3g; shaded = A > threshold',m.threshold)});
-xlabel(ax,'Time (s)'); ylabel(ax,'A (active E neurons)');
-xlim(ax,[0 shown_end]); ylim(ax,[0 top]);
-legend(ax,[h1 h2],{'Network activity','Threshold'},'Location','best');
+if isfield(m,'threshold')
+    yline(ax,m.threshold,'--','Color',[0 0.35 0.8]);
+    ylabel(ax,'Active E neurons');
+    subtitle(ax,sprintf('Bin = %.3g ms; threshold = %.3g',m.bin_ms,m.threshold));
+else
+    ylabel(ax,'Spikes / bin');
+    subtitle(ax,sprintf('Bin = %.4g ms',m.bin_ms));
+end
+title(ax,'A  Avalanche detection'); xlabel(ax,'Time (s)');
 
-ax = nexttile(t,2);
-draw_ma_distribution(ax,m.size_distribution,'S (total active-neuron counts)');
-title(ax,{'B  Avalanche size distribution',sprintf('τ = %.3f; complete events: %d',m.tau,m.complete_count)});
+ax = nexttile(tl,2);
+plot_dist(ax,m.size_distribution,'S');
+title(ax,'B  Size distribution');
+subtitle(ax,sprintf('τ = %.3f; n = %d',m.tau,m.complete_count));
 
-ax = nexttile(t,3);
-draw_ma_distribution(ax,m.duration_distribution,'D (40-ms bins)');
-title(ax,{'C  Avalanche duration distribution',sprintf('α_D = %.3f',m.alpha_D)});
+ax = nexttile(tl,3);
+plot_dist(ax,m.duration_distribution,'D (bins)');
+title(ax,'C  Duration distribution');
+subtitle(ax,sprintf('α = %.3f',m.alpha_D));
 
-ax = nexttile(t,4);
-c = m.scaling;
-loglog(ax,c.duration_bins,c.mean_size,'o','Color',[0.6 0.6 0.6],'MarkerSize',5);
+ax = nexttile(tl,4);
+c = m.scaling; % 大小-时长标度
+loglog(ax,c.duration_bins,c.mean_size,'o','Color',[0.6 0.6 0.6],'MarkerSize',4);
 hold(ax,'on');
 if any(c.used)
     loglog(ax,c.duration_bins(c.used),c.mean_size(c.used),'o', ...
         'Color',[0 0.35 0.8],'MarkerFaceColor',[0 0.35 0.8],'MarkerSize',4);
 end
 if isfinite(c.beta_fit)
-    x = logspace(log10(min(c.duration_bins(c.used))),log10(max(c.duration_bins(c.used))),100);
-    hfit = loglog(ax,x,exp(c.intercept)*x.^c.beta_fit,'-', ...
+    x = logspace(log10(min(c.duration_bins(c.used))),log10(max(c.duration_bins(c.used))),100); % 拟合横坐标
+    h1 = loglog(ax,x,exp(c.intercept)*x.^c.beta_fit,'-', ... % 实测拟合线
         'Color',[0 0.35 0.8],'LineWidth',1.4);
     if isfinite(c.beta_pred)
-        pivot = exp(mean(log(c.duration_bins(c.used))));
-        anchor = exp(c.intercept)*pivot^c.beta_fit;
-        hpred = loglog(ax,x,anchor*(x/pivot).^c.beta_pred,'--', ...
+        D0 = exp(mean(log(c.duration_bins(c.used)))); % 对齐时长
+        S0 = exp(c.intercept)*D0^c.beta_fit; % 对齐大小
+        h2 = loglog(ax,x,S0*(x/D0).^c.beta_pred,'--', ... % 预测斜率线
             'Color',[0.8 0.25 0.1],'LineWidth',1.4);
-        if c.valid
-            labels = {'Fitted slope','Predicted slope'};
-        else
-            labels = {'Candidate fit','Candidate prediction'};
-        end
-        legend(ax,[hfit hpred],labels,'Location','best');
+        legend(ax,[h1 h2],{'Fitted','Predicted'},'Location','best');
     end
 end
-if c.valid
-    summary = sprintf('β_{fit}=%.3f; β_{pred}=%.3f; DCC=%.3f',c.beta_fit,c.beta_pred,c.DCC);
-else
-    summary = sprintf('DCC unavailable; β_{fit}=%.3f; β_{pred}=%.3f',c.beta_fit,c.beta_pred);
-end
-title(ax,{'D  Mean size versus duration',summary});
-xlabel(ax,'D (40-ms bins)'); ylabel(ax,'Mean S at fixed D');
-if isempty(c.duration_bins)
-    text(ax,0.5,0.5,'No complete avalanches','Units','normalized','HorizontalAlignment','center');
-end
-title(t,'Ma framework: 40-ms bins; 35th percentile; S = total event activity');
-exportgraphics(f,result.ma_figure,'Resolution',180);
+title(ax,'D  Mean size versus duration');
+subtitle(ax,sprintf('β_{fit}=%.3f; β_{pred}=%.3f; DCC=%.3f', ...
+    c.beta_fit,c.beta_pred,c.DCC));
+xlabel(ax,'D (bins)'); ylabel(ax,'Mean S');
+title(tl,name);
+exportgraphics(f,file,'Resolution',180);
 close(f);
 end
 
-function draw_ma_distribution(ax,distribution,x_label)
-loglog(ax,distribution.value,distribution.probability,'o', ...
-    'Color',[0 0.35 0.8],'MarkerSize',4);
+function plot_dist(ax,d,xl)
+% ax：坐标轴；d：分布结果；xl：横轴名
+loglog(ax,d.value,d.probability,'o','Color',[0 0.35 0.8],'MarkerSize',4);
 hold(ax,'on');
-fit = distribution.fit;
-if ~isempty(fit.support)
-    loglog(ax,fit.support,fit.probability*fit.n_used/fit.n_total, ...
+f = d.fit; % 幂律拟合
+if ~isempty(f.support)
+    loglog(ax,f.support,f.probability*f.n_used/f.n_total, ...
         '-','Color',[0.8 0.25 0.1],'LineWidth',1.4);
-    if fit.valid
-        label = sprintf('MLE [%g, %g]',fit.xmin,fit.xmax);
+    if f.valid
+        lab = 'MLE fit'; % 拟合图例
     else
-        label = 'MLE candidate (screen not passed)';
+        lab = 'MLE candidate';
     end
-    legend(ax,{'Observed',label},'Location','best');
+    legend(ax,{'Data',lab},'Location','best');
 end
-xlabel(ax,x_label); ylabel(ax,'Probability per discrete value');
-if isempty(distribution.value)
-    text(ax,0.5,0.5,'No complete avalanches','Units','normalized','HorizontalAlignment','center');
+xlabel(ax,xl); ylabel(ax,'Probability');
 end
+
+function plot_ikeda(m,file)
+% m：Ikeda结果；file：图片路径
+f = figure('Visible','off','Color','w','Theme','light','Position',[100 100 1100 440]); % 图窗
+tl = tiledlayout(f,1,2,'TileSpacing','compact','Padding','compact'); % 子图布局
+ax = nexttile(tl,1); % 当前坐标轴
+d = m.size_distribution; % 大小分布
+loglog(ax,d.value,d.probability,'o','Color',[0 0.35 0.8],'MarkerSize',4);
+hold(ax,'on');
+c = m.fit; % 线性拟合
+if c.valid
+    x = c.xmin:c.xmax; % 拟合范围
+    loglog(ax,x,10.^polyval([c.slope c.intercept],log10(x)), ...
+        '-','Color',[0.8 0.25 0.1],'LineWidth',1.4);
+    legend(ax,{'Data','OLS fit'},'Location','best');
+end
+title(ax,'A  Size distribution');
+subtitle(ax,sprintf('k = %.3f; fit = [%g, %g]',c.slope,c.xmin,c.xmax));
+xlabel(ax,'S (spikes)'); ylabel(ax,'P(S)');
+
+ax = nexttile(tl,2);
+d = m.deviation;
+if ~isempty(d.S)
+    h = bar(ax,d.S,[max(d.value,0) min(d.value,0)],1,'stacked','EdgeColor','none'); % 偏差柱形
+    h(1).FaceColor = [0 0.35 0.8];
+    h(2).FaceColor = [0.8 0.25 0.1];
+else
+    text(ax,0.5,0.5,'Insufficient fit range','Units','normalized','HorizontalAlignment','center');
+end
+hold(ax,'on');
+yline(ax,0,'Color',[0.2 0.2 0.2]);
+title(ax,'B  Deviation from fit');
+subtitle(ax,sprintf('\\Delta Cr = %.4g',m.DeltaCr));
+xlabel(ax,'S (spikes)'); ylabel(ax,'P_{emp} - P_{fit}');
+title(tl,sprintf('Ikeda; interval = %.4g ms',m.interval_ms));
+exportgraphics(f,file,'Resolution',180);
+close(f);
 end

@@ -1,182 +1,176 @@
-function out = analyze_stepp(spikes,W_EE,dt_ms)
+function out = analyze_stepp(X,W,dt_ms) % X：放电矩阵；W：权重(后×前)；dt_ms：步长(ms)；out：结果
 % Stepp：连接追踪、branching ratio、ISI-DFA。
-if nargin < 3, dt_ms = 1; end
-spikes = logical(spikes);
-[neuron_count,time_count] = size(spikes);
-A = W_EE > 0;
-A(1:neuron_count+1:end) = false;
-[event_neuron,event_step] = find(spikes);
-event_count = numel(event_step);
-lags = 2:4;
+if nargin < 3
+    dt_ms = 1;
+end
 
-sizes = zeros(event_count,1);
-start_step = zeros(event_count,1,'uint32');
-start_neuron = zeros(event_count,1,'uint16');
-last_step = zeros(event_count,1,'uint32');
-root_mark = zeros(event_count,1,'uint32');
-memberships = cell(neuron_count,5);
-history_spikers = cell(1,5);
-history_event = zeros(neuron_count,5,'uint32');
-root_count = 0; event_index = 0;
+%% 连接追踪
+X = logical(X);
+[N,T] = size(X); % N：神经元数；T：步数
+A = W > 0; % 连接矩阵(后×前)
+A(1:N+1:end) = false;
+K = nnz(X); % spike总数
+lags = 2:4; % 追踪延迟(步)
 
-preview_count = min(200,nnz((event_step-1)*dt_ms < 100));
-preview_memberships = cell(preview_count,1);
-preview_edges = cell(preview_count,1);
-branching = NaN(1,time_count);
-pre_counts = NaN(1,time_count);
-post_counts = NaN(1,time_count);
+S = zeros(K,1); % 各雪崩大小
+t0 = zeros(K,1,'uint32'); % 起始步
+i0 = zeros(K,1,'uint16'); % 起始神经元
+t1 = zeros(K,1,'uint32'); % 最后放电步
+lab = cell(N,5); % spike标签缓存
+prev = cell(1,5); % 发放细胞缓存
+nr = 0; % 雪崩数
 
-for t = 1:time_count
-    slot = mod(t-1,5)+1;
-    previous = history_spikers{slot};
-    if ~isempty(previous)
-        memberships(previous,slot) = {[]};
-        history_event(previous,slot) = 0;
+br = NaN(1,T); % 分支比
+npre = NaN(1,T); % 上游计数
+npost = NaN(1,T); % 下游计数
+
+for t = 1:T % 当前时间步
+    slot = mod(t-1,5)+1; % 当前缓存槽
+    old = prev{slot}; % 待清理细胞
+    if ~isempty(old)
+        lab(old,slot) = {[]};
     end
-    active = find(spikes(:,t));
-    history_spikers{slot} = active;
+    ids = find(X(:,t)); % 当前发放细胞
+    prev{slot} = ids;
 
-    for neuron = active'
-        event_index = event_index+1;
-        parents_for_preview = cell(1,numel(lags));
-        for j = 1:numel(lags)
-            parent_time = t-lags(j);
-            if parent_time < 1, continue; end
-            parent_slot = mod(parent_time-1,5)+1;
-            candidates = history_spikers{parent_slot};
-            parents = candidates(A(neuron,candidates));
-            for parent = parents'
-                inherited = memberships{parent,parent_slot};
-                root_mark(inherited) = event_index;
+    for i = ids' % 当前神经元
+        tags = cell(numel(lags),1); % 各延迟父标签
+        for k = 1:numel(lags) % 延迟索引
+            tp = t-lags(k); % 上游时间步
+            if tp < 1
+                continue;
             end
-            if event_index <= preview_count
-                parents_for_preview{j} = history_event(parents,parent_slot);
-            end
+            sp = mod(tp-1,5)+1; % 上游缓存槽
+            cand = prev{sp}; % 候选父细胞
+            parents = cand(A(i,cand)); % 已连接父细胞
+            tags{k} = vertcat(lab{parents,sp});
         end
 
-        labels = uint32(find(root_mark(1:root_count) == event_index));
+        labels = unique(vertcat(tags{:})); % 继承的雪崩标签
         if isempty(labels)
-            root_count = root_count+1;
-            labels = uint32(root_count);
-            start_step(root_count) = t;
-            start_neuron(root_count) = neuron;
+            nr = nr+1;
+            labels = uint32(nr);
+            t0(nr) = t;
+            i0(nr) = i;
         end
-        sizes(labels) = sizes(labels)+1;
-        last_step(labels) = t;
-        memberships{neuron,slot} = labels;
-        history_event(neuron,slot) = event_index;
-        if event_index <= preview_count
-            preview_memberships{event_index} = labels;
-            parents = uint32(reshape(vertcat(parents_for_preview{:}),[],1));
-            preview_edges{event_index} = [parents,repmat(uint32(event_index),numel(parents),1)];
-        end
+        S(labels) = S(labels)+1;
+        t1(labels) = t;
+        lab{i,slot} = labels;
     end
 
-    if t >= 5 && t <= time_count-4 && ~isempty(active)
-        pre_active = any(spikes(:,t-lags),2);
-        post_active = any(spikes(:,t+lags),2);
-        pre_counts(t) = sum(A(active,pre_active),'all');
-        post_counts(t) = sum(A(post_active,active),'all');
-        if pre_counts(t) > 0
-            branching(t) = post_counts(t)/pre_counts(t);
+    if t >= 5 && t <= T-4 && ~isempty(ids)
+        pre = any(X(:,t-lags),2); % 窗内上游活跃
+        post = any(X(:,t+lags),2); % 窗内下游活跃
+        npre(t) = sum(A(ids,pre),'all');
+        npost(t) = sum(A(post,ids),'all');
+        if npre(t) > 0
+            br(t) = npost(t)/npre(t);
         end
     end
 end
 
-sizes = sizes(1:root_count);
-start_step = start_step(1:root_count);
-start_neuron = start_neuron(1:root_count);
-last_step = last_step(1:root_count);
-right_censored = double(last_step)+max(lags) > time_count;
-out.parameters = struct('phi',1,'Delta',3,'lags',lags,'dt_ms',dt_ms);
-out.G = A';
-out.tracking = struct('size',sizes,'start_step',start_step, ...
-    'start_neuron',start_neuron,'last_step',last_step, ...
-    'right_censored',right_censored,'complete_sizes',sizes(~right_censored), ...
-    'total_count',root_count,'complete_count',nnz(~right_censored));
-out.size_distribution = size_distribution(sizes(~right_censored));
-out.branching = struct('time_ms',(0:time_count-1)*dt_ms,'value',branching, ...
-    'pre_count',pre_counts,'post_count',post_counts, ...
-    'valid_count',nnz(isfinite(branching)),'mean',mean(branching,'omitnan'));
-out.preview = struct('step_index',uint32(event_step(1:preview_count)), ...
-    'neuron_id',uint16(event_neuron(1:preview_count)));
-out.preview.time_ms = (double(out.preview.step_index)-1)*dt_ms;
-out.preview.memberships = preview_memberships;
-out.preview.parent_edges = zeros(0,2,'uint32');
-if preview_count > 0
-    out.preview.parent_edges = reshape(vertcat(preview_edges{:}),[],2);
-end
-out.dfa = neuron_dfa(spikes,dt_ms);
+%% 分布与输出
+S = S(1:nr);
+t0 = t0(1:nr);
+i0 = i0(1:nr);
+t1 = t1(1:nr);
+cut = double(t1)+max(lags) > T; % 右端截断标记
+out.parameters = struct('phi',1,'Delta',3,'lags',lags,'dt_ms',dt_ms); % 时间窗参数
+out.G = A'; % 连接图(前×后)
+out.tracking = struct('size',S,'start_step',t0, ...
+    'start_neuron',i0,'last_step',t1,'right_censored',cut, ...
+    'complete_sizes',S(~cut),'total_count',nr,'complete_count',nnz(~cut)); % 雪崩记录
+out.size_distribution = size_pmf(S(~cut)); % 大小分布
+out.branching = struct('time_ms',(0:T-1)*dt_ms,'value',br, ...
+    'pre_count',npre,'post_count',npost, ...
+    'valid_count',nnz(isfinite(br)),'mean',mean(br,'omitnan')); % 分支比记录
+out.dfa = isi_dfa(X,dt_ms); % 各神经元DFA
 end
 
-function distribution = size_distribution(sizes)
-[S,~,index] = unique(sizes);
-counts = zeros(size(S));
-if ~isempty(S), counts = accumarray(index,1,[numel(S) 1]); end
-P = counts/max(numel(sizes),1);
-distribution = struct('S',S,'P',P,'counts',counts, ...
+%% 大小分布
+function pdf = size_pmf(S) % S：雪崩大小；pdf：大小分布
+[s,~,g] = unique(S); % s：不同大小；g：分组编号
+n = zeros(size(s)); % 各大小次数
+if ~isempty(s)
+    n = accumarray(g,1,[numel(s) 1]);
+end
+p = n/max(numel(S),1); % 大小概率
+pdf = struct('S',s,'P',p,'counts',n, ...
     'slope',NaN,'intercept',NaN,'r_squared',NaN,'fit_valid',false, ...
-    'fit_min',NaN,'fit_max',NaN,'n_avalanches',numel(sizes));
-if numel(S) >= 3
-    x = log10(S); y = log10(P);
-    coefficients = polyfit(x,y,1);
-    fitted = polyval(coefficients,x);
-    total = sum((y-mean(y)).^2);
-    distribution.slope = coefficients(1);
-    distribution.intercept = coefficients(2);
-    if total > 0, distribution.r_squared = 1-sum((y-fitted).^2)/total; end
-    distribution.fit_valid = true;
-    distribution.fit_min = min(S);
-    distribution.fit_max = max(S);
+    'fit_min',NaN,'fit_max',NaN,'n_avalanches',numel(S));
+if numel(s) >= 3
+    x = log10(s); % 对数大小
+    y = log10(p); % 对数概率
+    coef = polyfit(x,y,1); % 直线系数
+    fit = polyval(coef,x); % 拟合值
+    ss = sum((y-mean(y)).^2); % 总平方和
+    pdf.slope = coef(1);
+    pdf.intercept = coef(2);
+    if ss > 0
+        pdf.r_squared = 1-sum((y-fit).^2)/ss;
+    end
+    pdf.fit_valid = true;
+    pdf.fit_min = min(s);
+    pdf.fit_max = max(s);
 end
 end
 
-function dfa = neuron_dfa(spikes,dt_ms)
-neuron_count = size(spikes,1);
-dfa.ISI_ms = cell(neuron_count,1);
-dfa.scales = cell(neuron_count,1);
-dfa.F = cell(neuron_count,1);
-dfa.F_squared = cell(neuron_count,1);
-dfa.ISI_count = zeros(neuron_count,1);
-dfa.alpha = NaN(neuron_count,1);
-dfa.intercept = NaN(neuron_count,1);
-dfa.r_squared = NaN(neuron_count,1);
-dfa.scale_span_decades = NaN(neuron_count,1);
-dfa.limited_span = true(neuron_count,1);
-for neuron = 1:neuron_count
-    ISI = diff(find(spikes(neuron,:)))'*dt_ms;
-    dfa.ISI_ms{neuron} = ISI;
-    dfa.ISI_count(neuron) = numel(ISI);
-    max_scale = floor(numel(ISI)/4);
-    if max_scale < 4, continue; end
-    scales = unique(round(logspace(log10(4),log10(max_scale),12)));
-    profile = cumsum(ISI-mean(ISI));
-    F = zeros(size(scales));
-    for k = 1:numel(scales)
-        l = scales(k);
-        M = floor(numel(ISI)/l);
-        z = reshape(profile(1:M*l),l,M);
-        x = (1:l)'; x = x-mean(x);
-        slopes = (x'*z)/(x'*x);
-        trends = mean(z,1)+x*slopes;
-        residual = z-trends;
-        F(k) = sqrt(mean(residual(:).^2));
+%% ISI-DFA
+function dfa = isi_dfa(X,dt_ms) % X：放电矩阵；dt_ms：步长(ms)；dfa：DFA结果
+N = size(X,1); % 神经元数
+dfa.ISI_ms = cell(N,1); % 各细胞ISI(ms)
+dfa.scales = cell(N,1); % 分段长度
+dfa.F = cell(N,1); % 均方根波动(ms)
+dfa.F_squared = cell(N,1); % 波动平方(ms²)
+dfa.ISI_count = zeros(N,1); % 各细胞ISI数
+dfa.alpha = NaN(N,1); % DFA指数
+dfa.intercept = NaN(N,1); % 对数拟合截距
+dfa.r_squared = NaN(N,1); % 拟合R²
+dfa.scale_span_decades = NaN(N,1); % 尺度跨度(数量级)
+dfa.limited_span = true(N,1); % 短跨度标记
+
+for i = 1:N % 神经元编号
+    isi = diff(find(X(i,:)))'*dt_ms; % 放电间隔(ms)
+    dfa.ISI_ms{i} = isi;
+    dfa.ISI_count(i) = numel(isi);
+    lmax = floor(numel(isi)/4); % 最长分段
+    if lmax < 4
+        continue;
     end
-    dfa.scales{neuron} = scales;
-    dfa.F{neuron} = F;
-    dfa.F_squared{neuron} = F.^2;
-    usable = isfinite(F) & F > 0;
-    if nnz(usable) < 4 || all(ISI == ISI(1)), continue; end
-    x = log10(scales(usable)); y = log10(F(usable));
-    coefficients = polyfit(x,y,1);
-    fitted = polyval(coefficients,x);
-    total = sum((y-mean(y)).^2);
-    dfa.alpha(neuron) = coefficients(1);
-    dfa.intercept(neuron) = coefficients(2);
-    if total > 0, dfa.r_squared(neuron) = 1-sum((y-fitted).^2)/total; end
-    dfa.scale_span_decades(neuron) = max(x)-min(x);
-    dfa.limited_span(neuron) = max(x)-min(x) < 1;
+    ls = unique(round(logspace(log10(4),log10(lmax),12))); % 段长序列
+    cum = cumsum(isi-mean(isi)); % 去均值累积序列
+    F = zeros(size(ls)); % 各尺度波动
+    for k = 1:numel(ls) % 尺度索引
+        l = ls(k); % 当前段长
+        M = floor(numel(isi)/l); % 片段数量
+        z = reshape(cum(1:M*l),l,M); % 累积序列分段
+        x = (1:l)'; % 拟合横坐标
+        x = x-mean(x);
+        a = (x'*z)/(x'*x); % 各段斜率
+        fit = mean(z,1)+x*a; % 拟合值
+        r = z-fit; % 去趋势残差
+        F(k) = sqrt(mean(r(:).^2));
+    end
+    dfa.scales{i} = ls;
+    dfa.F{i} = F;
+    dfa.F_squared{i} = F.^2;
+    ok = isfinite(F) & F > 0; % 有效尺度标记
+    if nnz(ok) < 4 || all(isi == isi(1))
+        continue;
+    end
+    x = log10(ls(ok));
+    y = log10(F(ok)); % 对数波动
+    coef = polyfit(x,y,1); % 直线系数
+    fit = polyval(coef,x);
+    ss = sum((y-mean(y)).^2); % 总平方和
+    dfa.alpha(i) = coef(1);
+    dfa.intercept(i) = coef(2);
+    if ss > 0
+        dfa.r_squared(i) = 1-sum((y-fit).^2)/ss;
+    end
+    dfa.scale_span_decades(i) = max(x)-min(x);
+    dfa.limited_span(i) = max(x)-min(x) < 1;
 end
-dfa.valid_count = nnz(isfinite(dfa.alpha));
-dfa.adequate_span_count = nnz(isfinite(dfa.alpha) & ~dfa.limited_span);
+dfa.valid_count = nnz(isfinite(dfa.alpha)); % 有效拟合数
+dfa.adequate_span_count = nnz(isfinite(dfa.alpha) & ~dfa.limited_span); % 足够跨度数
 end
